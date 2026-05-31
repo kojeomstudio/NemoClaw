@@ -37,6 +37,11 @@ export interface SandboxEntry {
   providerCredentialHashes?: Record<string, string>;
   messagingChannels?: string[];
   messagingChannelConfig?: MessagingChannelConfig;
+  hermesToolGateways?: string[];
+  hermesDashboardEnabled?: boolean;
+  hermesDashboardPort?: number | null;
+  hermesDashboardInternalPort?: number | null;
+  hermesDashboardTui?: boolean;
   disabledChannels?: string[];
   dashboardPort?: number | null;
 }
@@ -214,6 +219,14 @@ export function registerSandbox(entry: SandboxEntry): void {
         entry.messagingChannelConfig && Object.keys(entry.messagingChannelConfig).length > 0
           ? { ...entry.messagingChannelConfig }
           : undefined,
+      hermesToolGateways:
+        Array.isArray(entry.hermesToolGateways) && entry.hermesToolGateways.length > 0
+          ? [...entry.hermesToolGateways]
+          : undefined,
+      hermesDashboardEnabled: entry.hermesDashboardEnabled === true ? true : undefined,
+      hermesDashboardPort: entry.hermesDashboardPort ?? undefined,
+      hermesDashboardInternalPort: entry.hermesDashboardInternalPort ?? undefined,
+      hermesDashboardTui: entry.hermesDashboardTui === true ? true : undefined,
       disabledChannels:
         Array.isArray(entry.disabledChannels) && entry.disabledChannels.length > 0
           ? [...entry.disabledChannels]
