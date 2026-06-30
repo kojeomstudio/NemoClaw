@@ -3,18 +3,28 @@
 
 import { isIP } from "node:net";
 
-import { dockerExecFileSync, dockerSpawnSync } from "../../adapters/docker";
+import {
+  dockerExecFileSync,
+  dockerSpawnSync,
+  type DockerSpawnSyncResult,
+} from "../../adapters/docker/exec";
 import { CLI_NAME } from "../../cli/branding";
+import type { SandboxEntry } from "../../state/registry";
 import * as registry from "../../state/registry";
 
 const K3S_CONTAINER = "openshell-cluster-nemoclaw";
 const HOST_ALIAS_KUBECTL_TIMEOUT_MS = 10_000;
 const HOST_ALIAS_DOCKER_PROBE_TIMEOUT_MS = 5_000;
 
-type LegacyGatewayProbe =
+export type LegacyGatewayProbe =
   | { state: "present" }
   | { state: "absent" }
   | { state: "unknown"; reason: string };
+
+export type LegacyGatewayHostAliasSupportDeps = {
+  getSandbox: (sandboxName: string) => Pick<SandboxEntry, "openshellDriver"> | null | undefined;
+  probeLegacyGatewayContainer: () => LegacyGatewayProbe;
+};
 
 // Drivers that run a per-sandbox direct container (openshell-<sandbox>...)
 // instead of the legacy k3s gateway. They have no openshell-cluster-nemoclaw
@@ -72,9 +82,7 @@ function hostAliasesFail(lines: string | readonly string[], exitCode = 1): never
 }
 
 function normalizeDriver(driver: unknown): string | null {
-  return typeof driver === "string" && driver.trim()
-    ? driver.trim().toLowerCase()
-    : null;
+  return typeof driver === "string" && driver.trim() ? driver.trim().toLowerCase() : null;
 }
 
 // Host aliases are persisted on the legacy Kubernetes gateway `Sandbox`
@@ -85,8 +93,11 @@ function normalizeDriver(driver: unknown): string | null {
 // message instead of targeting a container that does not exist (#4516) — and
 // without pretending a one-time /etc/hosts edit inside the direct container
 // would survive a sandbox restart or rebuild.
-function assertLegacyGatewayHostAliasSupport(sandboxName: string): void {
-  const driver = normalizeDriver(registry.getSandbox(sandboxName)?.openshellDriver);
+export function assertLegacyGatewayHostAliasSupportWithDeps(
+  sandboxName: string,
+  deps: LegacyGatewayHostAliasSupportDeps,
+): void {
+  const driver = normalizeDriver(deps.getSandbox(sandboxName)?.openshellDriver);
   if (driver && DIRECT_CONTAINER_DRIVERS.has(driver)) {
     hostAliasesFail([
       `  Host aliases are not supported on the '${driver}' driver sandbox '${sandboxName}'.`,
@@ -104,7 +115,7 @@ function assertLegacyGatewayHostAliasSupport(sandboxName: string): void {
   // openshell-cluster-nemoclaw`. Classify the probe result so a docker daemon
   // outage, timeout, or permission error does not get misreported as a
   // missing gateway container.
-  const probe = probeLegacyGatewayContainer();
+  const probe = deps.probeLegacyGatewayContainer();
   if (probe.state === "absent") {
     const driverLabel = driver ?? "unspecified";
     hostAliasesFail([
@@ -124,18 +135,23 @@ function assertLegacyGatewayHostAliasSupport(sandboxName: string): void {
   }
 }
 
-function probeLegacyGatewayContainer(): LegacyGatewayProbe {
+function assertLegacyGatewayHostAliasSupport(sandboxName: string): void {
+  assertLegacyGatewayHostAliasSupportWithDeps(sandboxName, {
+    getSandbox: registry.getSandbox,
+    probeLegacyGatewayContainer,
+  });
+}
+
+export function probeLegacyGatewayContainerWithDeps(
+  dockerPs: () => DockerSpawnSyncResult,
+): LegacyGatewayProbe {
   // `docker ps --filter name=...` accepts only substring or anchored regex
   // syntax (`name=^/<container>$`) per the Docker CLI reference, and the
   // anchor form is fragile across daemon versions. Mirror the unfiltered
   // `docker ps --format '{{.Names}}'` pattern used in
   // src/lib/sandbox/privileged-exec.ts and do the exact match in code so
   // there is no doubt about substring overlap or anchor support.
-  const result = dockerSpawnSync(["ps", "--format", "{{.Names}}"], {
-    stdio: ["ignore", "pipe", "pipe"],
-    encoding: "utf-8",
-    timeout: HOST_ALIAS_DOCKER_PROBE_TIMEOUT_MS,
-  });
+  const result = dockerPs();
   if (result.error) {
     const code = (result.error as NodeJS.ErrnoException).code ?? "";
     if (code === "ETIMEDOUT") {
@@ -158,6 +174,16 @@ function probeLegacyGatewayContainer(): LegacyGatewayProbe {
   return present ? { state: "present" } : { state: "absent" };
 }
 
+function probeLegacyGatewayContainer(): LegacyGatewayProbe {
+  return probeLegacyGatewayContainerWithDeps(() =>
+    dockerSpawnSync(["ps", "--format", "{{.Names}}"], {
+      stdio: ["ignore", "pipe", "pipe"],
+      encoding: "utf-8",
+      timeout: HOST_ALIAS_DOCKER_PROBE_TIMEOUT_MS,
+    }),
+  );
+}
+
 function validateHostAliasHostname(hostname: string): boolean {
   if (!hostname || hostname.length > 253) return false;
   return hostname.split(".").every((label) => {
@@ -170,13 +196,10 @@ function normalizeHostAliasHostname(hostname: string): string {
 }
 
 function runKubectlInClusterRaw(args: string[]): string {
-  return dockerExecFileSync(
-    ["exec", K3S_CONTAINER, "kubectl", "-n", "openshell", ...args],
-    {
-      stdio: ["ignore", "pipe", "pipe"],
-      timeout: HOST_ALIAS_KUBECTL_TIMEOUT_MS,
-    },
-  );
+  return dockerExecFileSync(["exec", K3S_CONTAINER, "kubectl", "-n", "openshell", ...args], {
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: HOST_ALIAS_KUBECTL_TIMEOUT_MS,
+  });
 }
 
 function throwKubectlError(action: string, error: unknown): never {
@@ -194,7 +217,10 @@ function runKubectlInCluster(args: string[], action: string): string {
 }
 
 function getSandboxResource(sandboxName: string): SandboxResource {
-  const raw = runKubectlInCluster(["get", "sandbox", sandboxName, "-o", "json"], "read host aliases");
+  const raw = runKubectlInCluster(
+    ["get", "sandbox", sandboxName, "-o", "json"],
+    "read host aliases",
+  );
   try {
     return JSON.parse(raw) as SandboxResource;
   } catch (error) {
@@ -305,7 +331,10 @@ export function listSandboxHostAliases(sandboxName: string): void {
   }
 }
 
-function validateAddOptions(options: AddSandboxHostAliasOptions): { hostname: string; ip: string } {
+export function validateSandboxHostAliasAddOptions(options: AddSandboxHostAliasOptions): {
+  hostname: string;
+  ip: string;
+} {
   const { hostname: rawHostname, ip } = options;
   if (!rawHostname || !ip) {
     hostAliasesFail(`  Usage: ${CLI_NAME} <sandbox> hosts-add <hostname> <ip> [--dry-run]`);
@@ -320,7 +349,9 @@ function validateAddOptions(options: AddSandboxHostAliasOptions): { hostname: st
   return { hostname, ip };
 }
 
-function validateRemoveOptions(options: RemoveSandboxHostAliasOptions): { hostname: string } {
+export function validateSandboxHostAliasRemoveOptions(options: RemoveSandboxHostAliasOptions): {
+  hostname: string;
+} {
   const { hostname: rawHostname } = options;
   if (!rawHostname) {
     hostAliasesFail(`  Usage: ${CLI_NAME} <sandbox> hosts-remove <hostname> [--dry-run]`);
@@ -337,7 +368,7 @@ export function addSandboxHostAlias(
   options: AddSandboxHostAliasOptions = {},
 ): void {
   const dryRun = Boolean(options.dryRun);
-  const { hostname, ip } = validateAddOptions(options);
+  const { hostname, ip } = validateSandboxHostAliasAddOptions(options);
   assertLegacyGatewayHostAliasSupport(sandboxName);
 
   const resource = getSandboxResource(sandboxName);
@@ -370,7 +401,7 @@ export function removeSandboxHostAlias(
   options: RemoveSandboxHostAliasOptions = {},
 ): void {
   const dryRun = Boolean(options.dryRun);
-  const { hostname } = validateRemoveOptions(options);
+  const { hostname } = validateSandboxHostAliasRemoveOptions(options);
   assertLegacyGatewayHostAliasSupport(sandboxName);
 
   const resource = getSandboxResource(sandboxName);

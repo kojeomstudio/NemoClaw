@@ -117,11 +117,11 @@ function looksLikeTestFixturePath(text: string): boolean {
     /Dockerfile\.sandbox/.test(normalized) ||
     /(?:^|\/)fixtures?\//.test(normalized) ||
     /\.agents\/skills/.test(normalized) ||
-    // The isolated scenario suite under test/e2e-scenario/ is entirely test
-    // assets and a self-contained runtime: scenario manifests, validation
+    // The isolated E2E suite under test/e2e/ is entirely test
+    // assets and a self-contained runtime: target manifests, validation
     // suite YAMLs, expected-state YAMLs, and the suite's own runner. Reads of
     // these paths are not source-shape coupling to product code.
-    /(?:^|["'`/])test\/e2e-scenario(?:["'`/]|$)/.test(normalized)
+    /(?:^|["'`/])test\/e2e(?:["'`/]|$)/.test(normalized)
   );
 }
 
@@ -208,18 +208,6 @@ function isReadFileCall(node: ts.CallExpression): boolean {
     return expression.name.text === "readFileSync" || expression.name.text === "readFile";
   }
   return false;
-}
-
-function isSourceTextLikeName(name: string): boolean {
-  return /(src|source|text|content|body|block|snippet|heredoc|docker|script|shell|fn|lines?|matches|calls|usages)/i.test(
-    name,
-  );
-}
-
-function isTextDerivation(initText: string): boolean {
-  return /(\.indexOf\b|\.search\b|\.includes\b|\.match(All)?\b|\.slice\b|\.split\b|\.replace(All)?\b|\.trim(End)?\b|\.join\b|String\(|(?:YAML|yaml|JSON)\.parse\b|yaml\.load\b|Heredoc\b|Snippet\b|Block\b|extract[A-Z]|load[A-Z]|parse[A-Z])/.test(
-    initText,
-  );
 }
 
 function isExecutionResultDerivation(initText: string): boolean {

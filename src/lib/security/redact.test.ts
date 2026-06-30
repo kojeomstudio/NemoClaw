@@ -14,10 +14,7 @@ describe("redactForLog", () => {
         model: "gpt-4o",
         refreshToken: "refresh-token-value",
       },
-      items: [
-        { name: "safe" },
-        { credentialEnv: "NVIDIA_API_KEY" },
-      ],
+      items: [{ name: "safe" }, { credentialEnv: "NVIDIA_INFERENCE_API_KEY" }],
     });
 
     expect(result).toEqual({
@@ -27,10 +24,7 @@ describe("redactForLog", () => {
         model: "gpt-4o",
         refreshToken: "<REDACTED>",
       },
-      items: [
-        { name: "safe" },
-        { credentialEnv: "<REDACTED>" },
-      ],
+      items: [{ name: "safe" }, { credentialEnv: "<REDACTED>" }],
     });
   });
 
@@ -44,6 +38,18 @@ describe("redactForLog", () => {
       message: "upstream returned Authorization: Bearer <REDACTED>",
       url: "https://example.test/path?access_token=<REDACTED>",
     });
+  });
+
+  it("redacts generated private-key blocks inside otherwise safe strings", () => {
+    const privateKey = [
+      ["-----BEGIN", "PRIVATE KEY-----"].join(" "),
+      "unknown-generated-private-key-material",
+      ["-----END", "PRIVATE KEY-----"].join(" "),
+    ].join("\\n");
+
+    const result = redactForLog({ snapshot: JSON.stringify({ privateKey }) });
+
+    expect(result).toEqual({ snapshot: '{"privateKey":"<REDACTED>"}' });
   });
 
   it("does not recurse forever on circular objects", () => {
