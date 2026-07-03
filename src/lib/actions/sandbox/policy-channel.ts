@@ -37,6 +37,7 @@ const onboardProviders = require("../../onboard/providers");
 import { filterSetupPolicyPresetsForAgent } from "../../onboard/agent-policy-presets";
 import { getStoredMessagingChannelConfig } from "../../onboard/messaging-config";
 import * as policies from "../../policy";
+import { formatPolicyListPresetRow } from "../../policy/policy-list-display";
 
 const onboardSession =
   require("../../state/onboard-session") as typeof import("../../state/onboard-session");
@@ -137,7 +138,10 @@ export async function addSandboxPolicy(
   }
 
   const sandboxAgent = registry.getSandbox(sandboxName)?.agent ?? null;
-  const allPresets = filterSetupPolicyPresetsForAgent(policies.listPresets(), sandboxAgent);
+  const allPresets = filterSetupPolicyPresetsForAgent(
+    policies.listPresets({ agent: sandboxAgent }),
+    sandboxAgent,
+  );
   const applied = policies.getAppliedPresets(sandboxName);
 
   let answer = null;
@@ -166,7 +170,7 @@ export async function addSandboxPolicy(
   }
   if (!answer) return;
 
-  const presetContent = policies.loadPreset(answer);
+  const presetContent = policies.loadPresetForSandbox(sandboxName, answer);
   if (!presetContent) return;
 
   const endpoints = policies.getPresetEndpoints(presetContent);
@@ -260,7 +264,8 @@ async function applyExternalPreset(
 }
 
 export function listSandboxPolicies(sandboxName: string) {
-  const builtin = policies.listPresets();
+  const sandboxEntry = registry.getSandbox(sandboxName);
+  const builtin = policies.listPresets({ agent: sandboxEntry?.agent ?? null });
   const custom = policies.listCustomPresets(sandboxName);
   const allPresets = [...builtin, ...custom];
   const registryPresets = policies.getAppliedPresets(sandboxName);
@@ -269,30 +274,24 @@ export function listSandboxPolicies(sandboxName: string) {
   // array of matched preset names when reachable (possibly empty).
   const gatewayPresets = policies.getGatewayPresets(sandboxName);
 
+  const provenanceContext = {
+    tierName: sandboxEntry?.policyTier ?? null,
+    agentName: sandboxEntry?.agent ?? null,
+  };
+
   console.log("");
   console.log(`  Policy presets for sandbox '${sandboxName}':`);
   allPresets.forEach((p: { name: string; description: string }) => {
     const inRegistry = registryPresets.includes(p.name);
     const inGateway = gatewayPresets ? gatewayPresets.includes(p.name) : null;
-
-    let marker;
-    let suffix = "";
-    if (inGateway === null) {
-      // Gateway unreachable — fall back to registry-only display
-      marker = inRegistry ? "●" : "○";
-    } else if (inRegistry && inGateway) {
-      marker = "●";
-    } else if (!inRegistry && !inGateway) {
-      marker = "○";
-    } else if (inGateway && !inRegistry) {
-      marker = "●";
-      suffix = " (active on gateway, missing from local state)";
-    } else {
-      // inRegistry && !inGateway
-      marker = "○";
-      suffix = " (recorded locally, not active on gateway)";
-    }
-    console.log(`    ${marker} ${p.name} — ${p.description}${suffix}`);
+    console.log(
+      formatPolicyListPresetRow({
+        preset: p,
+        provenanceContext,
+        inRegistry,
+        inGateway,
+      }),
+    );
   });
 
   if (gatewayPresets === null) {
@@ -949,7 +948,7 @@ export async function addSandboxChannel(
     process.exit(1);
   }
 
-  const presetContent = policies.loadPreset(canonical);
+  const presetContent = policies.loadPresetForSandbox(sandboxName, canonical);
   const presetPolicyKeys =
     presetContent === null ? [] : policies.parsePresetPolicyKeys(presetContent);
   if (presetContent === null || presetPolicyKeys.length === 0) {
@@ -1513,7 +1512,7 @@ export async function removeSandboxPolicy(
   // Resolve preset content: built-in first, then custom (persisted in
   // registry). Needed only for the endpoint preview below — removePreset()
   // itself re-resolves on the library side.
-  let presetContent: string | null = policies.loadPreset(answer);
+  let presetContent: string | null = policies.loadPresetForSandbox(sandboxName, answer);
   if (!presetContent) {
     const entry = customPresets.find((p: { name: string }) => p.name === answer);
     if (entry) {

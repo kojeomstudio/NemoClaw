@@ -44,7 +44,7 @@ const SWITCH_PROVIDER =
   (USE_COMPATIBLE_HOSTED ? "compatible-endpoint" : "nvidia-prod");
 const SWITCH_MODEL =
   process.env.NEMOCLAW_SWITCH_MODEL ??
-  (USE_COMPATIBLE_HOSTED ? DEFAULT_COMPAT_MODEL : "z-ai/glm-5.1");
+  (USE_COMPATIBLE_HOSTED ? DEFAULT_COMPAT_MODEL : "nvidia/nemotron-3-super-120b-a12b");
 const SWITCH_INFERENCE_API = process.env.NEMOCLAW_SWITCH_INFERENCE_API ?? "openai-completions";
 const SWITCH_MOCK_ANTHROPIC = process.env.NEMOCLAW_SWITCH_MOCK_ANTHROPIC ?? "0";
 const SWITCH_MOCK_PORT = parsePortEnv("NEMOCLAW_SWITCH_MOCK_PORT", 0);
@@ -441,7 +441,7 @@ async function assertOpenShellRoute(host: HostCliClient, home: string): Promise<
 
 async function assertRegistryAndSession(
   home: string,
-  options: { hostedEndpointUrl: string; mockProvider?: MockAnthropicProvider },
+  options: { mockProvider?: MockAnthropicProvider },
 ): Promise<void> {
   const registryPath = path.join(home, ".nemoclaw", "sandboxes.json");
   const registry = JSON.parse(fs.readFileSync(registryPath, "utf8")) as SandboxRegistry;
@@ -452,8 +452,8 @@ async function assertRegistryAndSession(
   expect(sandbox?.nimContainer).toBeNull();
   switch (SWITCH_PROVIDER) {
     case "compatible-endpoint":
-      expect(sandbox?.endpointUrl).toBe(options.hostedEndpointUrl);
-      expect(sandbox?.credentialEnv).toBe("COMPATIBLE_API_KEY");
+      expect(sandbox?.endpointUrl).toBeNull();
+      expect(sandbox?.credentialEnv).toBeNull();
       expect(sandbox?.preferredInferenceApi).toBe("openai-completions");
       break;
     case "compatible-anthropic-endpoint":
@@ -953,9 +953,9 @@ RUN_OPENCLAW_INFERENCE_SWITCH_TEST(
       });
     }
     const switchEndpointUrl =
-      SWITCH_PROVIDER === "compatible-endpoint"
-        ? hosted.endpointUrl
-        : await ensureCompatibleAnthropicSwitchProvider(host, home, mockProvider);
+      SWITCH_PROVIDER === "compatible-anthropic-endpoint"
+        ? await ensureCompatibleAnthropicSwitchProvider(host, home, mockProvider)
+        : null;
 
     const pidBefore = await openclawGatewayPid(sandbox, home);
     const switchResult = await runOpenClawInferenceSetWithRetry(
@@ -977,7 +977,7 @@ RUN_OPENCLAW_INFERENCE_SWITCH_TEST(
 
     await assertOpenShellRoute(host, home);
     await assertOpenClawConfig(sandbox, home);
-    await assertRegistryAndSession(home, { hostedEndpointUrl: hosted.endpointUrl, mockProvider });
+    await assertRegistryAndSession(home, { mockProvider });
 
     const inference = await checkSandboxInference(sandbox, home);
     if (inference !== "ok") {
