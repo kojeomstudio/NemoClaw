@@ -587,9 +587,8 @@ liveTest(
       skip("Docker is required for messaging compatible endpoint E2E");
     }
 
-    await artifacts.writeJson("target.json", {
+    await artifacts.target.declare({
       id: "messaging-compatible-endpoint",
-      runner: "vitest",
       boundary: "direct-cli-onboard-openshell-compatible-endpoint",
       refs: ["#2766", "#2572", "#5098"],
       contract: [
@@ -667,7 +666,7 @@ liveTest(
         : "Live Telegram-compatible round trip secrets not fully set",
     });
 
-    await artifacts.writeJson("target-result.json", {
+    await artifacts.target.complete({
       id: "messaging-compatible-endpoint",
       runner,
       endpointUrl,

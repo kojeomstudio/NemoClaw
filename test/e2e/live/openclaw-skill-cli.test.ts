@@ -139,9 +139,8 @@ runOpenClawSkillCliTest(
       "run `npm run build:cli` before live repo CLI targets",
     ).toBe(true);
 
-    await artifacts.writeJson("target.json", {
+    await artifacts.target.declare({
       id: "openclaw-skill-cli",
-      runner: "vitest",
       boundary: "install-sh-onboard-and-openclaw-skills-cli-in-sandbox",
       sandboxName: SANDBOX_NAME,
       contracts: [
@@ -268,7 +267,7 @@ runOpenClawSkillCliTest(
     );
     expect(resultText(check)).toContain(`"${SKILL_ID}"`);
 
-    await artifacts.writeJson("target-result.json", {
+    await artifacts.target.complete({
       id: "openclaw-skill-cli",
       status: "passed",
       sandboxName: SANDBOX_NAME,

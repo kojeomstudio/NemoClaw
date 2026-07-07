@@ -131,9 +131,8 @@ runDiagnosticsTest(
 
     const hosted = requireHostedInferenceConfig(secrets);
     const apiKey = hosted.apiKey;
-    await artifacts.writeJson("target.json", {
+    await artifacts.target.declare({
       id: "diagnostics",
-      runner: "vitest",
       boundary: "debug-archive-install-sh-docker-openshell-sandbox-exec-credentials",
       sandboxName: SANDBOX_NAME,
       contracts: [
@@ -407,7 +406,7 @@ runDiagnosticsTest(
       });
     }
 
-    await artifacts.writeJson("target-result.json", {
+    await artifacts.target.complete({
       id: "diagnostics",
       sandboxName: SANDBOX_NAME,
       model: hosted.model,

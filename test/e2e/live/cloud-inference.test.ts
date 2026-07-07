@@ -83,7 +83,7 @@ async function writePreContractExternalProviderSkip(
 ): Promise<void> {
   const evidence = buildPreContractExternalProviderSkipEvidence(install, classification);
   await artifacts.writeJson("transient-provider-validation.skip.json", evidence);
-  await artifacts.writeJson("target-result.json", evidence);
+  await artifacts.target.complete(evidence);
 }
 
 function testEnv(home: string, extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
@@ -233,9 +233,8 @@ test.skipIf(!shouldRunLiveE2E())(
       `missing sandbox skill validator: ${SANDBOX_SKILL_VALIDATOR}`,
     ).toBe(true);
 
-    await artifacts.writeJson("target.json", {
+    await artifacts.target.declare({
       id: "cloud-inference",
-      runner: "vitest",
       boundary: "install-sh-onboard-sandbox-inference-local-skill-filesystem",
       contracts: [
         "Docker is running before install/onboard",
@@ -329,7 +328,7 @@ test.skipIf(!shouldRunLiveE2E())(
         : "unknown";
     expect(sandboxSkillStatus, resultText(sandboxSkills)).not.toBe("unknown");
 
-    await artifacts.writeJson("target-result.json", {
+    await artifacts.target.complete({
       id: "cloud-inference",
       status: "passed",
       assertions: {
