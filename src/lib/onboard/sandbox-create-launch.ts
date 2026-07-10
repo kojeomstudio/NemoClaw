@@ -10,11 +10,40 @@ import type { HermesDashboardOnboardState } from "./hermes-dashboard";
 import { appendHermesDashboardEnvArgs } from "./hermes-dashboard";
 import { appendHostProxyEnvArgs } from "./host-proxy-env";
 import { appendOpenClawRuntimeEnvArgs } from "./openclaw-runtime-env";
+import {
+  prebuildSandboxImageIfEligible,
+  type SandboxPrebuildInput,
+  type SandboxPrebuildResult,
+} from "./sandbox-prebuild";
 
 type OpenshellShellCommand = (args: string[]) => string;
+type OpenshellArgv = (args: string[]) => string[];
+
+// These non-secret scheduler controls are intentionally forwarded for bounded
+// live-test and operator tuning. Keep this as an exact allowlist: the host's
+// broader NEMOCLAW_* environment must not become sandbox runtime input.
+const OPENCLAW_AUTO_PAIR_RUNTIME_ENV_KEYS = [
+  "NEMOCLAW_AUTO_PAIR_DEADLINE_SECS",
+  "NEMOCLAW_AUTO_PAIR_FAST_DEADLINE_SECS",
+  "NEMOCLAW_AUTO_PAIR_RUN_TIMEOUT_SECS",
+  "NEMOCLAW_AUTO_PAIR_SLOW_INTERVAL_SECS",
+] as const;
+
+function appendOpenClawAutoPairRuntimeEnvArgs(
+  envArgs: string[],
+  agent: AgentDefinition | null,
+  env: NodeJS.ProcessEnv,
+): void {
+  if (agent && agent.name !== "openclaw") return;
+  for (const key of OPENCLAW_AUTO_PAIR_RUNTIME_ENV_KEYS) {
+    const value = env[key]?.trim();
+    if (value) envArgs.push(formatEnvAssignment(key, value));
+  }
+}
 
 export interface SandboxCreateLaunchInput {
   agent: AgentDefinition | null | undefined;
+  observabilityEnabled?: boolean;
   chatUiUrl: string;
   createArgs: readonly string[];
   sandboxName?: string;
@@ -24,15 +53,26 @@ export interface SandboxCreateLaunchInput {
   hermesDashboardState: HermesDashboardOnboardState;
   manageDashboard?: boolean;
   openshellShellCommand: OpenshellShellCommand;
+  openshellArgv?: OpenshellArgv;
   buildEnv?(): Record<string, string>;
 }
 
 export interface SandboxCreateLaunch {
   createCommand: string;
+  createArgv: string[];
   effectiveDashboardPort: string;
   envArgs: string[];
   sandboxEnv: Record<string, string>;
   sandboxStartupCommand: string[];
+}
+
+export interface SandboxCreateLaunchWithPrebuildInput extends SandboxCreateLaunchInput {
+  sandboxName: string;
+  prebuild: Omit<SandboxPrebuildInput, "createArgs" | "sandboxName">;
+}
+
+export interface SandboxCreateLaunchWithPrebuild extends SandboxCreateLaunch {
+  prebuild: SandboxPrebuildResult;
 }
 
 export function prepareSandboxCreateLaunch(input: SandboxCreateLaunchInput): SandboxCreateLaunch {
@@ -54,6 +94,7 @@ export function prepareSandboxCreateLaunch(input: SandboxCreateLaunchInput): San
   }
 
   appendOpenClawRuntimeEnvArgs(envArgs, input.agent ?? null);
+  appendOpenClawAutoPairRuntimeEnvArgs(envArgs, input.agent ?? null, env);
   appendHermesDashboardEnvArgs(envArgs, input.hermesDashboardState, formatEnvAssignment);
   appendHostProxyEnvArgs(envArgs, env, {
     dropCredentialBearingProxyUrls: input.agent?.name === "langchain-deepagents-code",
@@ -80,6 +121,12 @@ export function prepareSandboxCreateLaunch(input: SandboxCreateLaunchInput): San
     if (sandboxName) {
       envArgs.push(formatEnvAssignment("NEMOCLAW_SANDBOX_NAME", sandboxName));
     }
+    envArgs.push(
+      formatEnvAssignment(
+        "NEMOCLAW_OBSERVABILITY",
+        input.observabilityEnabled === true ? "1" : "0",
+      ),
+    );
   }
 
   appendExtraPlaceholderKeysEnvArg(envArgs, input.extraPlaceholderKeys, formatEnvAssignment);
@@ -95,19 +142,34 @@ export function prepareSandboxCreateLaunch(input: SandboxCreateLaunchInput): San
   // command (awk, always 0) unless pipefail is set. Removing the pipe
   // lets the real exit code flow through to run().
   const sandboxStartupCommand = ["env", ...envArgs, "nemoclaw-start"];
-  const createCommand = `${input.openshellShellCommand([
-    "sandbox",
-    "create",
-    ...input.createArgs,
-    "--",
-    ...sandboxStartupCommand,
-  ])} 2>&1`;
+  const openshellArgs = ["sandbox", "create", ...input.createArgs, "--", ...sandboxStartupCommand];
+  const createCommand = `${input.openshellShellCommand(openshellArgs)} 2>&1`;
+  const createArgv = input.openshellArgv
+    ? input.openshellArgv(openshellArgs)
+    : ["bash", "-lc", createCommand];
 
   return {
     createCommand,
+    createArgv,
     effectiveDashboardPort,
     envArgs,
     sandboxEnv,
     sandboxStartupCommand,
+  };
+}
+
+/** Coordinate the optional local image build with the canonical launch renderer. */
+export async function prepareSandboxCreateLaunchWithPrebuild(
+  input: SandboxCreateLaunchWithPrebuildInput,
+): Promise<SandboxCreateLaunchWithPrebuild> {
+  const { prebuild: prebuildInput, ...launchInput } = input;
+  const prebuild = await prebuildSandboxImageIfEligible({
+    ...prebuildInput,
+    createArgs: input.createArgs,
+    sandboxName: input.sandboxName,
+  });
+  return {
+    ...prepareSandboxCreateLaunch({ ...launchInput, createArgs: prebuild.createArgs }),
+    prebuild,
   };
 }

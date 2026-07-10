@@ -2,14 +2,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Case: Deep Agents Code headless inference (#5619).
+# Case: Deep Agents Code headless inference and RLIMIT enforcement (#5619, #6545).
 #
 # Headless `dcode -n "<prompt>"`, run inside a built Deep Agents Code sandbox,
 # must route through the managed https://inference.local/v1 endpoint using the
 # placeholder OpenAI-compatible key NemoClaw writes into config.toml. The login
-# shell path must return PONG with exit 0; provider, connection, DNS, timeout, and
-# ambiguous failures are not acceptable. No real provider/proxy credentials may
-# appear in config.toml, .env, .mcp.json, /tmp/nemoclaw-proxy-env.sh, or output.
+# shell path must reject an empty prompt with exit 2, then return PONG with exit
+# 0 for a real prompt; provider, connection, DNS, timeout, and ambiguous failures
+# are not acceptable. No real provider/proxy credentials may appear in
+# config.toml, .env, .mcp.json, /tmp/nemoclaw-proxy-env.sh, or output.
+# The sandbox entrypoint, direct managed launcher, and both login/interactive
+# shell paths must keep the documented nproc=512 and nofile=65536 contract.
 # Direct DNS/hosts resolution is intentionally not required: OpenShell's managed
 # proxy routes inference.local when the request follows the normalized path.
 # Keep these phases in one ordered acceptance check: the absent-DNS observation
@@ -49,6 +52,19 @@ sandbox_login_exec() {
     HOME=/sandbox bash -lc "$1" 2>&1
 }
 
+sandbox_interactive_exec() {
+  openshell sandbox exec --name "$SANDBOX_NAME" -- env \
+    -u HTTP_PROXY -u HTTPS_PROXY -u NO_PROXY \
+    -u http_proxy -u https_proxy -u no_proxy \
+    -u ALL_PROXY -u all_proxy \
+    HOME=/sandbox bash --noprofile --rcfile /etc/bash.bashrc -ic "$1" 2>&1
+}
+
+sandbox_direct_rlimit_exec() {
+  openshell sandbox exec --name "$SANDBOX_NAME" -- \
+    /usr/local/lib/nemoclaw/dcode-managed-exec bash -c "$1" 2>&1
+}
+
 sandbox_direct_dcode() {
   openshell sandbox exec --name "$SANDBOX_NAME" --timeout "$HEADLESS_TIMEOUT" -- dcode "$@" 2>&1
 }
@@ -56,7 +72,7 @@ sandbox_direct_dcode() {
 sandbox_dcode_wrapper_contract() {
   # Keep the remote argv on one line: OpenShell rejects newline-bearing args.
   # shellcheck disable=SC2016
-  sandbox_exec 'dcode_path="$(command -v dcode 2>/dev/null || true)"; [ "$dcode_path" = /usr/local/bin/dcode ] && [ -x /usr/local/lib/nemoclaw/dcode-launcher.sh ] && [ -x /usr/local/lib/nemoclaw/dcode-wrapper.sh ] && cmp -s /usr/local/bin/dcode /usr/local/lib/nemoclaw/dcode-launcher.sh && python3 -c '\''import importlib.util,sys; sys.exit(0 if importlib.util.find_spec("deepagents_code") else 1)'\'' && printf "%s\\n" NEMOCLAW_DCODE_WRAPPER_CHAIN_OK'
+  sandbox_exec 'dcode_path="$(command -v dcode 2>/dev/null || true)"; [ "$dcode_path" = /usr/local/bin/dcode ] && [ -x /usr/local/lib/nemoclaw/dcode-launcher.sh ] && [ -x /usr/local/lib/nemoclaw/dcode-managed-exec ] && [ -x /usr/local/lib/nemoclaw/dcode-wrapper.sh ] && cmp -s /usr/local/bin/dcode /usr/local/lib/nemoclaw/dcode-launcher.sh && cmp -s /usr/local/lib/nemoclaw/dcode-managed-exec /usr/local/lib/nemoclaw/dcode-launcher.sh && python3 -c '\''import importlib.util,sys; sys.exit(0 if importlib.util.find_spec("deepagents_code") else 1)'\'' && printf "%s\\n" NEMOCLAW_DCODE_WRAPPER_CHAIN_OK'
 }
 
 nemoclaw_connect_probe() {
@@ -75,9 +91,29 @@ sandbox_login_proxy_contract() {
   sandbox_login_exec "$contract_command"
 }
 
+dcode_entrypoint_rlimit_contract_command() {
+  local proc_root="${1:-/proc}"
+  local quoted_proc_root
+  printf -v quoted_proc_root '%q' "$proc_root"
+  # Keep the generated command on one physical line and bind it to the unique
+  # argv marker installed by start.sh's exec -a. OpenShell remains PID 1.
+  # shellcheck disable=SC2016
+  printf '%s%s%s' 'set -euo pipefail; contract_fail() { printf "%s\n" "NEMOCLAW_DCODE_ENTRYPOINT_RLIMIT_FAIL:$1"; exit 1; }; proc_root=' "$quoted_proc_root" '; entrypoint_pid=""; for proc_dir in "$proc_root"/[0-9]*; do [ -d "$proc_dir" ] && [ -r "$proc_dir/cmdline" ] || continue; if ! cmdline="$(tr "\000" "\n" < "$proc_dir/cmdline" 2>/dev/null)"; then continue; fi; argc="$(printf "%s\n" "$cmdline" | awk "END { print NR }")"; [ "$argc" = 3 ] || continue; argv0="$(printf "%s\n" "$cmdline" | sed -n "1p")"; argv1="$(printf "%s\n" "$cmdline" | sed -n "2p")"; argv2="$(printf "%s\n" "$cmdline" | sed -n "3p")"; if [ "$argv0" = nemoclaw-dcode-entrypoint ] && [ "$argv1" = -f ] && [ "$argv2" = /dev/null ]; then [ -z "$entrypoint_pid" ] || contract_fail process-count; entrypoint_pid="${proc_dir##*/}"; fi; done; [ -n "$entrypoint_pid" ] || contract_fail process-count; limits="$proc_root/$entrypoint_pid/limits"; [ -r "$limits" ] || contract_fail limits; nproc_soft="$(awk "\$1 == \"Max\" && \$2 == \"processes\" { print \$3; exit }" "$limits")"; nproc_hard="$(awk "\$1 == \"Max\" && \$2 == \"processes\" { print \$4; exit }" "$limits")"; nofile_soft="$(awk "\$1 == \"Max\" && \$2 == \"open\" && \$3 == \"files\" { print \$4; exit }" "$limits")"; nofile_hard="$(awk "\$1 == \"Max\" && \$2 == \"open\" && \$3 == \"files\" { print \$5; exit }" "$limits")"; for value in "$nproc_soft" "$nproc_hard" "$nofile_soft" "$nofile_hard"; do case "$value" in "" | *[!0-9]*) contract_fail nonnumeric ;; esac; done; [ "$nproc_soft" = 512 ] && [ "$nproc_hard" = 512 ] || contract_fail nproc; [ "$nofile_soft" = 65536 ] && [ "$nofile_hard" = 65536 ] || contract_fail nofile; printf "%s\n" NEMOCLAW_DCODE_ENTRYPOINT_RLIMIT_OK'
+}
+
+sandbox_entrypoint_rlimit_contract() {
+  sandbox_exec "$(dcode_entrypoint_rlimit_contract_command /proc)"
+}
+
+rlimit_shell_contract_command() {
+  # Keep this command on one physical line: OpenShell rejects CR/LF in argv.
+  # shellcheck disable=SC2016
+  printf '%s' 'set -euo pipefail; contract_fail() { printf "%s\n" "NEMOCLAW_DCODE_SHELL_RLIMIT_FAIL:$1"; exit 1; }; nproc_soft="$(ulimit -Su)"; nproc_hard="$(ulimit -Hu)"; nofile_soft="$(ulimit -Sn)"; nofile_hard="$(ulimit -Hn)"; for value in "$nproc_soft" "$nproc_hard" "$nofile_soft" "$nofile_hard"; do case "$value" in "" | *[!0-9]*) contract_fail nonnumeric ;; esac; done; [ "$nproc_soft" = 512 ] && [ "$nproc_hard" = 512 ] || contract_fail nproc; [ "$nofile_soft" = 65536 ] && [ "$nofile_hard" = 65536 ] || contract_fail nofile; set +e; ulimit -Su 513 >/dev/null 2>&1; raise_nproc="$?"; ulimit -Sn 65537 >/dev/null 2>&1; raise_nofile="$?"; set -e; [ "$raise_nproc" -ne 0 ] || contract_fail raise-nproc; [ "$raise_nofile" -ne 0 ] || contract_fail raise-nofile; printf "%s\n" NEMOCLAW_DCODE_SHELL_RLIMIT_OK'
+}
+
 sandbox_artifact_scan_command() {
   cat <<'SCAN'
-for path in /sandbox/.deepagents/config.toml /sandbox/.deepagents/.env /sandbox/.deepagents/.mcp.json /tmp/nemoclaw-proxy-env.sh; do
+for path in /sandbox/.deepagents/config.toml /sandbox/.deepagents/.env /sandbox/.deepagents/.mcp.json /sandbox/.deepagents/.nemoclaw-mcp.json /tmp/nemoclaw-proxy-env.sh; do
   if [ -e "$path" ]; then
     cat "$path" 2>/dev/null || true
   fi
@@ -124,6 +160,10 @@ is_inference_connection_failure() {
 
 is_actionable_inference_error() {
   grep -Eiq 'API key|authentication|authorization|unauthorized|forbidden|rate[ -]?limit|quota|HTTP[[:space:]]*(401|403|404|429|5[0-9]{2})|status[[:space:]]*(401|403|404|429|5[0-9]{2})|(inference\.local|provider|model|NVIDIA|OpenAI).*(error|failed|failure|invalid|unavailable)|(error|failed|failure|invalid|unavailable).*(inference\.local|provider|model|NVIDIA|OpenAI)'
+}
+
+is_empty_prompt_rejection() {
+  grep -Fxq 'NemoClaw: empty non-interactive prompt for -n; provide prompt text.'
 }
 
 # Route reachability is proved separately with /v1/models. This classifier has
@@ -199,6 +239,60 @@ main() {
     pass "managed dcode launcher, wrapper, and Python module are installed"
   else
     fail_test "managed dcode wrapper chain is missing or incomplete"
+  fi
+
+  entrypoint_rlimit_output="$(sandbox_entrypoint_rlimit_contract || true)"
+  if printf '%s\n' "$entrypoint_rlimit_output" | grep -Fxq "NEMOCLAW_DCODE_ENTRYPOINT_RLIMIT_OK"; then
+    pass "dcode entrypoint process tree enforces nproc=512 and nofile=65536"
+  else
+    entrypoint_rlimit_reason="$(printf '%s\n' "$entrypoint_rlimit_output" | sed -n 's/^NEMOCLAW_DCODE_ENTRYPOINT_RLIMIT_FAIL:\([a-z-]*\)$/\1/p' | tail -n1)"
+    fail_test "dcode entrypoint process tree does not enforce resource limits (${entrypoint_rlimit_reason:-unknown contract mismatch})"
+  fi
+
+  rlimit_contract_command="$(rlimit_shell_contract_command)"
+  login_rlimit_output="$(sandbox_login_exec "$rlimit_contract_command" || true)"
+  if printf '%s\n' "$login_rlimit_output" | grep -Fxq "NEMOCLAW_DCODE_SHELL_RLIMIT_OK"; then
+    pass "dcode login shell enforces and cannot raise nproc/nofile limits"
+  else
+    login_rlimit_reason="$(printf '%s\n' "$login_rlimit_output" | sed -n 's/^NEMOCLAW_DCODE_SHELL_RLIMIT_FAIL:\([a-z-]*\)$/\1/p' | tail -n1)"
+    fail_test "dcode login shell does not enforce resource limits (${login_rlimit_reason:-unknown contract mismatch})"
+  fi
+
+  interactive_rlimit_output="$(sandbox_interactive_exec "$rlimit_contract_command" || true)"
+  if printf '%s\n' "$interactive_rlimit_output" | grep -Fxq "NEMOCLAW_DCODE_SHELL_RLIMIT_OK"; then
+    pass "dcode interactive/connect shell enforces and cannot raise nproc/nofile limits"
+  else
+    interactive_rlimit_reason="$(printf '%s\n' "$interactive_rlimit_output" | sed -n 's/^NEMOCLAW_DCODE_SHELL_RLIMIT_FAIL:\([a-z-]*\)$/\1/p' | tail -n1)"
+    fail_test "dcode interactive/connect shell does not enforce resource limits (${interactive_rlimit_reason:-unknown contract mismatch})"
+  fi
+
+  direct_rlimit_output="$(sandbox_direct_rlimit_exec "$rlimit_contract_command" || true)"
+  if printf '%s\n' "$direct_rlimit_output" | grep -Fxq "NEMOCLAW_DCODE_SHELL_RLIMIT_OK"; then
+    pass "direct dcode launcher enforces and cannot raise nproc/nofile limits"
+  else
+    direct_rlimit_reason="$(printf '%s\n' "$direct_rlimit_output" | sed -n 's/^NEMOCLAW_DCODE_SHELL_RLIMIT_FAIL:\([a-z-]*\)$/\1/p' | tail -n1)"
+    fail_test "direct dcode launcher does not enforce resource limits (${direct_rlimit_reason:-unknown contract mismatch})"
+  fi
+
+  # The status expansion belongs to the remote login shell.
+  # shellcheck disable=SC2016
+  empty_login_output="$(sandbox_login_exec 'timeout 10 dcode -n ""; status=$?; printf "\nNEMOCLAW_DCODE_EMPTY_EXIT:%s\n" "$status"' || true)"
+  empty_login_exit="$(printf '%s' "$empty_login_output" | sed -n 's/.*NEMOCLAW_DCODE_EMPTY_EXIT:\([0-9]\+\).*/\1/p' | tail -n1)"
+  if [ "$empty_login_exit" = "2" ] && printf '%s\n' "$empty_login_output" | is_empty_prompt_rejection; then
+    pass "login-shell dcode rejects an empty non-interactive prompt with exit 2"
+  else
+    fail_test "login-shell dcode did not reject an empty non-interactive prompt with exit 2 (exit ${empty_login_exit:-unknown})"
+  fi
+
+  if empty_direct_output="$(sandbox_direct_dcode -n "")"; then
+    empty_direct_exit=0
+  else
+    empty_direct_exit=$?
+  fi
+  if [ "$empty_direct_exit" = "2" ] && printf '%s\n' "$empty_direct_output" | is_empty_prompt_rejection; then
+    pass "direct-exec dcode rejects an empty non-interactive prompt with exit 2"
+  else
+    fail_test "direct-exec dcode did not reject an empty non-interactive prompt with exit 2 (exit ${empty_direct_exit})"
   fi
 
   # 1. config.toml points at the managed inference route, not a real provider host.
@@ -289,6 +383,12 @@ DCODE_EXIT:${direct_exit}"
   leak_scan="$(sandbox_exec "$(sandbox_artifact_scan_command)" || true)"
   combined="${config_output}
 ${leak_scan}
+${entrypoint_rlimit_output}
+${login_rlimit_output}
+${interactive_rlimit_output}
+${direct_rlimit_output}
+${empty_login_output}
+${empty_direct_output}
 ${dns_hosts_output}
 ${proxy_contract_output}
 ${route_output}

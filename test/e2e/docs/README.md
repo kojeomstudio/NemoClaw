@@ -74,16 +74,13 @@ npx vitest run --project e2e-support --silent=false --reporter=default
 # Opt-in live E2E targets
 npm run build:cli
 NEMOCLAW_RUN_LIVE_E2E=1 npx vitest run --project e2e-live --silent=false --reporter=default
-
-# Force two retries locally (three total attempts) for external-service flakes
-NEMOCLAW_RUN_LIVE_E2E=1 NEMOCLAW_E2E_RETRIES=2 npx vitest run --project e2e-live
 ```
 
-Live E2E projects retry failed tests automatically in CI. The default is
-2 retries after the first failure (3 total attempts). Local opt-in runs default
-to no full-test retry; set `NEMOCLAW_E2E_RETRIES=<count>` to override either
-local or CI behavior. Overrides are capped at 5 retries so a typo cannot create
-unbounded credentialed live infrastructure attempts.
+Live E2E projects do not retry an entire failed test. These tests mutate host,
+Docker, gateway, and sandbox state, so re-entering one on the same runner can
+replace the original failure with stale-lock, storage-exhaustion, or ownership
+noise. A target may retry a transient operation only inside its own cleanup
+boundary. Retry a full target by starting a fresh workflow run and runner.
 
 The retired `--emit-matrix` and `--plan-only` paths must not be reintroduced.
 
@@ -101,6 +98,18 @@ test/e2e/
 
 ## CI Entry Points
 
+- `tools/advisors/risk-plan.mts` is the small deterministic selection policy
+  shared by PR Review Advisor, E2E Advisor, and the model-independent post-merge
+  shadow controller. It maps changed runtime surfaces to invariant families and
+  canonical `e2e.yaml` jobs; it is not a second test runner or migration-status
+  ledger.
+
+- `.github/workflows/post-merge-e2e-risk-gate-shadow.yaml` runs only for trusted pushes to
+  `main`. `tools/e2e-advisor/post-merge-risk-gate.mts` builds a plan from the exact
+  before/after SHAs, dispatches at most three automatic jobs, and validates
+  `risk-signal.json` evidence for every expected job and matrix shard. The
+  resulting check is post-merge shadow evidence, not a required PR gate.
+
 - `.github/workflows/e2e.yaml` runs selected or all supported
   live E2E targets and uploads an explicit artifact allowlist with
   JSON summaries plus action, log, and shell command-evidence directories under
@@ -112,11 +121,19 @@ test/e2e/
   These per-target timing summaries are artifact evidence only.
   The Slack and GitHub scorecard timing comparison remains scoped to the
   dedicated `cloud-onboard` artifact.
+  Exact-commit shadow dispatches require the requested checkout to equal the
+  workflow's current `main` commit and verify its reachability before
+  preparation. The controller uses GitHub's returned workflow-dispatch run ID
+  as the sole child-run selector for waiting, evidence download, and
+  completion, attaches `test/e2e/risk-signal-reporter.ts` to live Vitest
+  invocations, and suppresses PR reporting and scorecards.
 - `.github/workflows/e2e-branch-validation.yaml`, `macos-e2e.yaml`,
   `wsl-e2e.yaml`, `ollama-proxy-e2e.yaml`, and `regression-e2e.yaml` call
   focused E2E targets directly for their E2E coverage.
-- `vitest.config.ts` contains `e2e-support` for fast fixture/support
-  tests and `e2e-live` for opt-in live target execution.
+- `vitest.config.ts` contains `e2e-support` for fast fixture/support tests and
+  `e2e-live` for opt-in live target execution. The PR and `main` aggregate
+  checks require `e2e-support` for code changes; the project never opts into
+  live targets.
 
 ## Migration Tracking
 

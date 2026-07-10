@@ -29,6 +29,9 @@ const {
   withTimerBoundShieldsMutationLock,
 }: typeof import("../shields/timer-bound-lock") = require("../shields/timer-bound-lock");
 const {
+  withSandboxMutationLock,
+}: typeof import("../state/mcp-lifecycle-lock") = require("../state/mcp-lifecycle-lock");
+const {
   runOpenClawConfigGuard,
 }: typeof import("../shields/openclaw-config-lock") = require("../shields/openclaw-config-lock");
 const { isPrivateHostname, isPrivateIp } = require("../private-networks");
@@ -38,6 +41,10 @@ const {
 const {
   buildHermesUpstreamHeader,
 }: typeof import("./hermes-upstream-header") = require("./hermes-upstream-header");
+const {
+  parseConfig,
+  serializeConfig,
+}: typeof import("./config-format") = require("./config-format");
 
 type ConfigObject = import("../security/credential-filter").ConfigObject;
 type ConfigValue = import("../security/credential-filter").ConfigValue;
@@ -66,7 +73,7 @@ export interface AgentConfigTarget {
   configPath: string;
   /** Directory containing the config (for chown after cp) */
   configDir: string;
-  /** Config file format: "json" or "yaml" */
+  /** Config file format: "json", "yaml", or "toml" */
   format: string;
   /** Config file basename */
   configFile: string;
@@ -395,28 +402,6 @@ function classifyNewKeyGate(inputs: NewKeyGateInputs): NewKeyGate {
     return { mode: "refuse" };
   }
   return { mode: "prompt" };
-}
-
-/**
- * Parse a config file's raw text according to its format.
- */
-function parseConfig(raw: string, format: string): ConfigObject {
-  const parsed = format === "yaml" ? require("yaml").parse(raw) : JSON.parse(raw);
-  if (!isConfigObject(parsed)) {
-    throw new Error("Config is not an object.");
-  }
-  return parsed;
-}
-
-/**
- * Serialize a config object according to its format.
- */
-function serializeConfig(config: ConfigObject, format: string): string {
-  if (format === "yaml") {
-    const YAML = require("yaml");
-    return YAML.stringify(config);
-  }
-  return JSON.stringify(config, null, 2);
 }
 
 /**
@@ -908,6 +893,16 @@ async function configSet(sandboxName: string, opts: ConfigSetOpts = {}): Promise
       `  --restart is supported only for OpenClaw and Hermes; '${target.agentName}' config was not changed.`,
     );
   }
+  // dcode bakes its config into the sandbox image at build time, so — unlike
+  // OpenClaw/Hermes — it has no host-side config-mutation path (the same reason
+  // inference set refuses it, #6321). config get now reads TOML, but refuse
+  // config set cleanly and point at the only way to change it: re-onboard. #6548
+  if (target.format === "toml") {
+    const { CLI_NAME } = require("../cli/branding");
+    configFail(
+      `  config set is not available for '${target.agentName}': its config is baked into the sandbox image at build time. To change it, re-onboard with the new selection (e.g. ${CLI_NAME} onboard --agent dcode --name ${shellQuote(sandboxName)} --fresh).`,
+    );
+  }
   if (target.agentName === "openclaw" || target.agentName === "hermes") {
     const { isShieldsDown }: typeof import("../shields") = require("../shields");
     if (!isShieldsDown(sandboxName, false)) {
@@ -994,42 +989,44 @@ async function configSet(sandboxName: string, opts: ConfigSetOpts = {}): Promise
     configFail(`  URL validation failed${suffix}: ${message}`);
   }
 
-  // Serialize only the authoritative re-read/CAS write. Interactive approval
-  // and DNS validation above must not hold the shields transition lock across
-  // the auto-restore deadline. If anything changed while the user was
-  // deciding, fail closed and ask them to retry against the new baseline.
-  withTimerBoundShieldsMutationLock(sandboxName, "config set write", () => {
-    const { isShieldsDown }: typeof import("../shields") = require("../shields");
-    if (
-      (target.agentName === "openclaw" || target.agentName === "hermes") &&
-      !isShieldsDown(sandboxName, true)
-    ) {
-      configFail(
-        `  ${target.agentName} config changes are unavailable while shields are up for '${sandboxName}'. Run 'nemoclaw ${sandboxName} shields down' first.`,
-      );
-    }
-    const currentConfig = readSandboxConfig(sandboxName, target);
-    const currentConfigSha256 = (
-      currentConfig as ConfigObject & { [CONFIG_SOURCE_SHA256]?: string }
-    )[CONFIG_SOURCE_SHA256];
-    if (currentConfigSha256 !== initialConfigSha256) {
-      configFail(
-        `  ${target.agentName} config changed while this update was being validated. Re-run config set against the current value.`,
-      );
-    }
-    setDotpath(currentConfig, opts.key!, safeValue);
+  // Serialize only the authoritative re-read/CAS write under the shared
+  // sandbox lock and then the shields transition lock. Interactive approval
+  // and DNS validation above must not hold either lock across the auto-restore
+  // deadline. If anything changed while the user was deciding, fail closed.
+  await withSandboxMutationLock(sandboxName, () =>
+    withTimerBoundShieldsMutationLock(sandboxName, "config set write", () => {
+      const { isShieldsDown }: typeof import("../shields") = require("../shields");
+      if (
+        (target.agentName === "openclaw" || target.agentName === "hermes") &&
+        !isShieldsDown(sandboxName, true)
+      ) {
+        configFail(
+          `  ${target.agentName} config changes are unavailable while shields are up for '${sandboxName}'. Run 'nemoclaw ${sandboxName} shields down' first.`,
+        );
+      }
+      const currentConfig = readSandboxConfig(sandboxName, target);
+      const currentConfigSha256 = (
+        currentConfig as ConfigObject & { [CONFIG_SOURCE_SHA256]?: string }
+      )[CONFIG_SOURCE_SHA256];
+      if (currentConfigSha256 !== initialConfigSha256) {
+        configFail(
+          `  ${target.agentName} config changed while this update was being validated. Re-run config set against the current value.`,
+        );
+      }
+      setDotpath(currentConfig, opts.key!, safeValue);
 
-    console.log(`  Writing config to sandbox (${target.configPath})...`);
-    writeSandboxConfig(sandboxName, target, currentConfig);
-    recomputeSandboxConfigHash(sandboxName, target);
+      console.log(`  Writing config to sandbox (${target.configPath})...`);
+      writeSandboxConfig(sandboxName, target, currentConfig);
+      recomputeSandboxConfigHash(sandboxName, target);
 
-    appendAuditEntry({
-      action: "config_set",
-      sandbox: sandboxName,
-      timestamp: new Date().toISOString(),
-      reason: `config set ${target.agentName}:${opts.key}`,
-    });
-  });
+      appendAuditEntry({
+        action: "config_set",
+        sandbox: sandboxName,
+        timestamp: new Date().toISOString(),
+        reason: `config set ${target.agentName}:${opts.key}`,
+      });
+    }),
+  );
 
   console.log(`  ${target.agentName} config updated.`);
 

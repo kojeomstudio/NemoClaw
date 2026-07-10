@@ -12,6 +12,7 @@ REPO="${REPO:-$(pwd)}"
 CLI="${NEMOCLAW_E2E_CLI:-${REPO}/bin/nemoclaw.js}"
 PROJECT_VENV="/sandbox/.nemoclaw-e2e-project-venv"
 PROJECT_PYTHON="${PROJECT_VENV}/bin/python3"
+OBSERVABILITY_MARKER_BEFORE="absent"
 
 ok() { printf '%s\n' "${PREFIX}: OK ($*)"; }
 info() { printf '%s\n' "${PREFIX}: $*"; }
@@ -28,6 +29,14 @@ sandbox_exec() {
   openshell sandbox exec --name "$SANDBOX_NAME" -- bash -c "$1" 2>&1
 }
 
+observability_marker_value() {
+  # Expansion is intentionally deferred to the sandbox shell.
+  # shellcheck disable=SC2016
+  openshell sandbox exec --name "$SANDBOX_NAME" -- \
+    sh -c 'marker=/sandbox/.deepagents/.nemoclaw-observability-enabled; if test -f "$marker" && ! test -L "$marker"; then cat "$marker"; else printf "absent"; fi' \
+    2>/dev/null
+}
+
 nemoclaw_cli() {
   if [ -f "$CLI" ]; then
     node "$CLI" "$@"
@@ -38,6 +47,7 @@ nemoclaw_cli() {
 
 python_probe_source() {
   cat <<'PY'
+import json
 import sys
 import urllib.error
 import urllib.request
@@ -62,8 +72,14 @@ def is_policy_denial(text):
 
 
 url = sys.argv[1]
+request = urllib.request.Request(
+    url,
+    data=json.dumps({'query': 'nemoclaw reachability probe', 'max_results': 1}).encode('utf-8'),
+    headers={'Content-Type': 'application/json'},
+    method='POST',
+)
 try:
-    with urllib.request.urlopen(url, timeout=8) as response:
+    with urllib.request.urlopen(request, timeout=8) as response:
         print(f'REACHED:{response.status}')
 except urllib.error.HTTPError as exc:
     body = ''
@@ -106,6 +122,54 @@ python_probe() {
   sandbox_exec "$remote_cmd"
 }
 
+restore_observability_state() {
+  local marker_after restore_output state_invalid=0
+  marker_after="$(observability_marker_value || true)"
+  if [ "$OBSERVABILITY_MARKER_BEFORE" = "1" ] && [ "$marker_after" = "1" ]; then
+    pass "managed observability state remains enabled after policy-remove"
+    return 0
+  fi
+  if [ "$OBSERVABILITY_MARKER_BEFORE" = "1" ]; then
+    fail_test "managed observability marker was lost after policy-remove"
+  fi
+  state_invalid=1
+
+  if [ "$marker_after" != "1" ] \
+    && ! restore_output="$(openshell sandbox exec --name "$SANDBOX_NAME" -- \
+      /usr/bin/env NEMOCLAW_OBSERVABILITY=1 \
+      /usr/local/bin/nemoclaw-start /usr/bin/true 2>&1)"; then
+    fail_test "could not restore managed observability for ordered cleanup: $restore_output"
+    return 1
+  fi
+  if [ "$(observability_marker_value || true)" != "1" ]; then
+    fail_test "managed observability marker was not restored after policy-remove"
+    return 1
+  fi
+  pass "managed observability state restored for ordered cleanup"
+  return "$state_invalid"
+}
+
+restore_tavily_denial() {
+  local cleanup_status=0 remove_output post_remove_probe_output
+  if ! remove_output="$(nemoclaw_cli "$SANDBOX_NAME" policy-remove tavily --yes 2>&1)"; then
+    fail_test "policy-remove tavily failed after the opt-in proof: $remove_output"
+    cleanup_status=1
+  else
+    sleep "${NEMOCLAW_E2E_POLICY_SETTLE_SECONDS:-5}"
+    post_remove_probe_output="$(python_probe "https://api.tavily.com/search" || true)"
+    if [[ "$post_remove_probe_output" == *"BLOCKED:"* &&
+      "$post_remove_probe_output" != *"REACHED:"* ]]; then
+      pass "managed Deep Agents Code python returns to the default Tavily denial"
+    else
+      fail_test "policy-remove did not restore the default Tavily denial: $post_remove_probe_output"
+      cleanup_status=1
+    fi
+  fi
+
+  restore_observability_state || cleanup_status=1
+  return "$cleanup_status"
+}
+
 PASSED=0
 FAILED=0
 
@@ -122,8 +186,33 @@ if [ "${NEMOCLAW_E2E_TAVILY_SELF_TEST:-}" = "probe-command-shape" ]; then
         ;;
     esac
   }
-  python_probe "https://api.tavily.com/"
+  python_probe "https://api.tavily.com/search"
   exit 0
+fi
+
+if [ "${NEMOCLAW_E2E_TAVILY_SELF_TEST:-}" = "restore-denial" ]; then
+  OBSERVABILITY_MARKER_FIXTURE="$(mktemp)"
+  OBSERVABILITY_MARKER_BEFORE=1
+  printf '%s\n' "1" >"$OBSERVABILITY_MARKER_FIXTURE"
+  trap 'rm -f "$OBSERVABILITY_MARKER_FIXTURE"' EXIT
+  observability_marker_value() {
+    cat "$OBSERVABILITY_MARKER_FIXTURE"
+  }
+  nemoclaw_cli() {
+    [[ "$*" == "$SANDBOX_NAME policy-remove tavily --yes" ]] || return 1
+    [ "${NEMOCLAW_E2E_TAVILY_REMOVE_FIXTURE:-ok}" = "ok" ] || return 1
+    if [ "${NEMOCLAW_E2E_TAVILY_MARKER_FIXTURE:-preserve}" = "lose" ]; then
+      printf '%s\n' "absent" >"$OBSERVABILITY_MARKER_FIXTURE"
+    fi
+  }
+  openshell() {
+    [[ "$*" == "sandbox exec --name $SANDBOX_NAME -- /usr/bin/env NEMOCLAW_OBSERVABILITY=1 /usr/local/bin/nemoclaw-start /usr/bin/true" ]] || return 1
+    printf '%s\n' "1" >"$OBSERVABILITY_MARKER_FIXTURE"
+  }
+  cleanup_status=0
+  NEMOCLAW_E2E_POLICY_SETTLE_SECONDS=0 restore_tavily_denial || cleanup_status=$?
+  [ "$(cat "$OBSERVABILITY_MARKER_FIXTURE")" = "1" ]
+  exit "$cleanup_status"
 fi
 
 if ! sandbox_exec "test -d /sandbox/.deepagents && command -v dcode >/dev/null 2>&1" >/dev/null; then
@@ -157,11 +246,16 @@ APPLY_OUTPUT="$(nemoclaw_cli "$SANDBOX_NAME" policy-add tavily --yes 2>&1)" || {
   printf '%s\n' "${PREFIX}: $PASSED passed, $FAILED failed"
   exit 1
 }
+OBSERVABILITY_MARKER_BEFORE="$(observability_marker_value || true)"
+if [ "$OBSERVABILITY_MARKER_BEFORE" != "1" ]; then
+  fail_test "managed observability marker is absent after policy-add"
+fi
+trap restore_tavily_denial EXIT
 pass "tavily policy preset applies"
 
 sleep "${NEMOCLAW_E2E_POLICY_SETTLE_SECONDS:-5}"
 
-PROBE_OUTPUT="$(python_probe "https://api.tavily.com/")"
+PROBE_OUTPUT="$(python_probe "https://api.tavily.com/search")"
 if echo "$PROBE_OUTPUT" | grep -q "REACHED:"; then
   pass "managed Deep Agents Code python can reach Tavily after policy-add"
 elif echo "$PROBE_OUTPUT" | grep -q "BLOCKED:"; then
@@ -170,7 +264,7 @@ else
   fail_test "Tavily probe lacked reachability evidence after policy-add: $PROBE_OUTPUT"
 fi
 
-SYSTEM_PROBE_OUTPUT="$(python_probe "https://api.tavily.com/" "/usr/bin/python3" || true)"
+SYSTEM_PROBE_OUTPUT="$(python_probe "https://api.tavily.com/search" "/usr/bin/python3" || true)"
 if echo "$SYSTEM_PROBE_OUTPUT" | grep -q "BLOCKED:" && ! echo "$SYSTEM_PROBE_OUTPUT" | grep -q "REACHED:"; then
   pass "system Python remains blocked from Tavily after policy-add"
 elif echo "$SYSTEM_PROBE_OUTPUT" | grep -q "REACHED:"; then
@@ -181,7 +275,7 @@ fi
 
 PROJECT_OUT="$(sandbox_exec "if ! test -x ${PROJECT_PYTHON@Q}; then python3 -m venv --copies ${PROJECT_VENV@Q}; fi; test -x ${PROJECT_PYTHON@Q} && readlink -f ${PROJECT_PYTHON@Q}" || true)"
 if echo "$PROJECT_OUT" | grep -Fxq "$PROJECT_PYTHON"; then
-  PROJECT_PROBE_OUTPUT="$(python_probe "https://api.tavily.com/" "$PROJECT_PYTHON" || true)"
+  PROJECT_PROBE_OUTPUT="$(python_probe "https://api.tavily.com/search" "$PROJECT_PYTHON" || true)"
   if echo "$PROJECT_PROBE_OUTPUT" | grep -q "BLOCKED:" && ! echo "$PROJECT_PROBE_OUTPUT" | grep -q "REACHED:"; then
     pass "project venv Python under /sandbox remains blocked from Tavily after policy-add"
   elif echo "$PROJECT_PROBE_OUTPUT" | grep -q "REACHED:"; then
@@ -192,6 +286,10 @@ if echo "$PROJECT_OUT" | grep -Fxq "$PROJECT_PYTHON"; then
 else
   fail_test "project venv under /sandbox did not expose a usable python3 executable: $PROJECT_OUT"
 fi
+
+# Do not leak this check's durable opt-in into later sequential checks.
+restore_tavily_denial || true
+trap - EXIT
 
 printf '%s\n' "${PREFIX}: $PASSED passed, $FAILED failed"
 [ "$FAILED" -eq 0 ] || exit 1

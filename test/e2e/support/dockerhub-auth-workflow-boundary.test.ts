@@ -89,7 +89,7 @@ function writeExecutable(filePath: string, source: string): void {
 }
 
 describe("shared Docker Hub authentication workflow boundary", () => {
-  it("reuses one auth alias and one explicit audited cleanup step across every image job", () => {
+  it("reuses one auth alias and one explicit audited cleanup step across every image job (#6430)", () => {
     const workflow = loadWorkflow();
     const requiredJobs = imageJobNames(workflow);
     const canonicalAuth = namedStep(workflow.jobs.live, AUTH_STEP_NAME);
@@ -100,11 +100,8 @@ describe("shared Docker Hub authentication workflow boundary", () => {
       expect.arrayContaining([
         "live",
         "diagnostics",
-        "hermes-root-entrypoint-smoke",
-        "hermes-sandbox-secret-boundary",
         "messaging-compatible-endpoint",
         "openshell-gateway-auth-contract",
-        "runtime-overrides",
       ]),
     );
     expect(canonicalAuth).toBeDefined();
@@ -130,7 +127,9 @@ describe("shared Docker Hub authentication workflow boundary", () => {
         -1;
       const authIndex = job.steps?.findIndex((step) => step.name === AUTH_STEP_NAME) ?? -1;
       const cleanupIndex = job.steps?.findIndex((step) => step.name === CLEANUP_STEP_NAME) ?? -1;
-      expect(authIndex, `${jobName} auth order`).toBe(checkoutIndex + 1);
+      const expectedAuthIndex =
+        jobName === "jetson-nvmap-gpu" ? checkoutIndex + 2 : checkoutIndex + 1;
+      expect(authIndex, `${jobName} auth order`).toBe(expectedAuthIndex);
       expect(cleanupIndex, `${jobName} cleanup order`).toBe((job.steps?.length ?? 0) - 1);
     }
     expect(new Set(cleanupSteps).size, "cleanup steps must not consume the YAML alias budget").toBe(
@@ -166,7 +165,10 @@ describe("shared Docker Hub authentication workflow boundary", () => {
 
   it("rejects step-level Docker config overrides outside the canonical auth step", () => {
     const errors = validateMutation((workflow) => {
-      const run = namedStep(workflow.jobs["runtime-overrides"], "Run runtime overrides live test");
+      const run = namedStep(
+        workflow.jobs["messaging-compatible-endpoint"],
+        "Run messaging compatible endpoint live test",
+      );
       expect(run).toBeDefined();
       run!.env = {
         ...run!.env,
@@ -175,7 +177,7 @@ describe("shared Docker Hub authentication workflow boundary", () => {
     });
 
     expect(errors).toContain(
-      "runtime-overrides step 'Run runtime overrides live test' env must not include DOCKER_CONFIG",
+      "messaging-compatible-endpoint step 'Run messaging compatible endpoint live test' env must not include DOCKER_CONFIG",
     );
   });
 
@@ -210,10 +212,12 @@ describe("shared Docker Hub authentication workflow boundary", () => {
       cleanup!.run = `${String(cleanup!.run)} || true`;
       cleanup!.env = { DOCKER_CONFIG: "${{ github.workspace }}/docker-config" };
 
-      const runtimeSteps = workflow.jobs["runtime-overrides"].steps!;
-      const runtimeCleanupIndex = runtimeSteps.findIndex((step) => step.name === CLEANUP_STEP_NAME);
-      const [runtimeCleanup] = runtimeSteps.splice(runtimeCleanupIndex, 1);
-      runtimeSteps.splice(2, 0, runtimeCleanup);
+      const messagingSteps = workflow.jobs["messaging-compatible-endpoint"].steps!;
+      const messagingCleanupIndex = messagingSteps.findIndex(
+        (step) => step.name === CLEANUP_STEP_NAME,
+      );
+      const [messagingCleanup] = messagingSteps.splice(messagingCleanupIndex, 1);
+      messagingSteps.splice(2, 0, messagingCleanup);
     });
 
     expect(errors).toEqual(
@@ -234,7 +238,7 @@ describe("shared Docker Hub authentication workflow boundary", () => {
         "live Docker Hub cleanup step must contain exactly name, if, shell, and run",
         "live Docker Hub cleanup step must always run",
         `live Docker Hub cleanup step must run only ${CLEANUP_HELPER_RUN}`,
-        "runtime-overrides Docker Hub cleanup must be the final job step",
+        "messaging-compatible-endpoint Docker Hub cleanup must be the final job step",
       ]),
     );
   });

@@ -148,7 +148,10 @@ function validateIssueRoutingRetirement(errors: string[], workflow: OperationsWo
       ) {
         errors.push("report-to-pr must hold only pull-requests: write");
       }
-      if (job.if !== "${{ always() && github.event_name == 'workflow_dispatch' }}") {
+      if (
+        job.if !==
+        "${{ always() && github.event_name == 'workflow_dispatch' && !inputs.risk_shadow }}"
+      ) {
         errors.push("report-to-pr must run only for manual workflow dispatches");
       }
       const report = findStep(job, "Post E2E target results to PR");
@@ -212,7 +215,7 @@ function validateScorecard(errors: string[], workflow: OperationsWorkflow): void
   const permissions = permissionMap(job.permissions);
   if (
     job.if !==
-    "${{ always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}"
+    "${{ always() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && !inputs.risk_shadow)) }}"
   ) {
     errors.push("scorecard must run after scheduled and manual E2E executions");
   }
@@ -232,8 +235,16 @@ function validateScorecard(errors: string[], workflow: OperationsWorkflow): void
   if (checkout.with?.["persist-credentials"] !== false) {
     errors.push("scorecard checkout must disable persisted credentials");
   }
-  if (checkout.with?.["sparse-checkout"] !== "scripts/scorecard") {
-    errors.push("scorecard checkout must be limited to scripts/scorecard");
+  const sparseCheckout = String(checkout.with?.["sparse-checkout"] ?? "")
+    .split(/\r?\n/u)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  if (
+    sparseCheckout.length !== 2 ||
+    !sparseCheckout.includes("ci/onboard-performance-budget.json") ||
+    !sparseCheckout.includes("scripts/scorecard")
+  ) {
+    errors.push("scorecard checkout must be limited to scorecard builders and budget config");
   }
 
   const generate = findStep(job, "Generate E2E scorecard");
@@ -242,6 +253,9 @@ function validateScorecard(errors: string[], workflow: OperationsWorkflow): void
   for (const fragment of [
     "scripts/scorecard/analyze-trace-timing.ts",
     "traceTiming.buildTraceTimingResult",
+    "buildTraceTimingResult({ github, context, core })",
+    "budgetWarningMessage",
+    "core.warning(budgetWarningMessage)",
     "scripts/scorecard/summarize-jobs.ts",
     "scorecardJobs.isSelectiveDispatch",
     "scorecardJobs.loadWorkflowRunJobs",
@@ -329,9 +343,7 @@ function validateTraceTiming(errors: string[], workflow: OperationsWorkflow): vo
     if (!script.includes(fragment))
       errors.push(`cloud-onboard trace sanitizer must retain ${fragment}`);
   }
-  const sourceGuardIndex = script.indexOf(
-    '[ "${NEMOCLAW_TRACE_DIR}" != "${expected_trace_dir}" ]',
-  );
+  const sourceGuardIndex = script.indexOf('[ "${NEMOCLAW_TRACE_DIR}" != "${expected_trace_dir}" ]');
   const sanitizeCommandIndex = script.indexOf("python3 scripts/e2e/sanitize-trace-timing.py");
   if (
     sourceGuardIndex === -1 ||

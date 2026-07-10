@@ -13,8 +13,10 @@ const {
   VLLM_LOCAL_CREDENTIAL_ENV,
   getSandboxInferenceConfig,
 } = require("../inference/config");
+const openrouter = require("../inference/openrouter");
 const { isSafeModelId } = require("../validation");
 const { compactText } = require("../core/url-utils");
+const { readGatewayProviderMetadata } = require("./gateway-provider-metadata");
 
 // ── Constants ────────────────────────────────────────────────────
 
@@ -35,6 +37,8 @@ const NON_INTERACTIVE_PROVIDER_ALIASES = {
   cloud: "build",
   nim: "nim-local",
   vllm: "vllm",
+  "open-router": "openrouter",
+  openrouterai: "openrouter",
   anthropiccompatible: "anthropicCompatible",
   hermes: "hermesProvider",
   "hermes-provider": "hermesProvider",
@@ -44,6 +48,7 @@ const NON_INTERACTIVE_PROVIDER_ALIASES = {
 };
 const NON_INTERACTIVE_PROVIDER_KEYS = new Set([
   "build",
+  "openrouter",
   "openai",
   "anthropic",
   "anthropicCompatible",
@@ -60,7 +65,7 @@ const NON_INTERACTIVE_PROVIDER_KEYS = new Set([
   "start-windows-ollama",
 ]);
 const NON_INTERACTIVE_PROVIDER_VALID_VALUES =
-  "Valid values: build, openai, anthropic, anthropicCompatible, gemini, hermes-provider, ollama, custom, nim-local, vllm, routed, install-vllm, install-ollama, install-windows-ollama, start-windows-ollama";
+  "Valid values: build, openrouter, openai, anthropic, anthropicCompatible, gemini, hermes-provider, ollama, custom, nim-local, vllm, routed, install-vllm, install-ollama, install-windows-ollama, start-windows-ollama";
 const PROVIDER_KEY_ROUTE_VALUES = new Set(
   [
     "inference",
@@ -77,6 +82,17 @@ const REMOTE_PROVIDER_CONFIG = {
     credentialEnv: "NVIDIA_INFERENCE_API_KEY",
     endpointUrl: BUILD_ENDPOINT_URL,
     helpUrl: "https://build.nvidia.com/settings/api-keys",
+    modelMode: "catalog",
+    defaultModel: DEFAULT_CLOUD_MODEL,
+    skipVerify: true,
+  },
+  openrouter: {
+    label: "OpenRouter",
+    providerName: openrouter.OPENROUTER_PROVIDER_NAME,
+    providerType: openrouter.OPENROUTER_PROVIDER_TYPE,
+    credentialEnv: openrouter.OPENROUTER_CREDENTIAL_ENV,
+    endpointUrl: openrouter.OPENROUTER_ENDPOINT_URL,
+    helpUrl: openrouter.OPENROUTER_HELP_URL,
     modelMode: "catalog",
     defaultModel: DEFAULT_CLOUD_MODEL,
     skipVerify: true,
@@ -212,8 +228,8 @@ function getEffectiveProviderName(providerKey) {
 
 // ── Non-interactive helpers ──────────────────────────────────────
 
-function getNonInteractiveProvider() {
-  stageHostedInferenceSourceSecretEnv();
+function getNonInteractiveProvider(allowHostedInferenceStaging = true) {
+  if (allowHostedInferenceStaging) stageHostedInferenceSourceSecretEnv();
   const providerKey = (process.env.NEMOCLAW_PROVIDER || "").trim().toLowerCase();
   if (!providerKey) return null;
   const normalized = NON_INTERACTIVE_PROVIDER_ALIASES[providerKey] || providerKey;
@@ -303,13 +319,14 @@ function getNonInteractiveModel(providerKey) {
 }
 
 // No default for nonInteractive — onboard.ts wrapper supplies isNonInteractive().
-function getRequestedProviderHint(nonInteractive) {
-  return nonInteractive ? getNonInteractiveProvider() : null;
+function getRequestedProviderHint(nonInteractive, allowHostedInferenceStaging = true) {
+  return nonInteractive ? getNonInteractiveProvider(allowHostedInferenceStaging) : null;
 }
 
-function getRequestedModelHint(nonInteractive) {
+function getRequestedModelHint(nonInteractive, allowHostedInferenceStaging = true) {
   if (!nonInteractive) return null;
-  const providerKey = getRequestedProviderHint(nonInteractive) || "cloud";
+  const providerKey =
+    getRequestedProviderHint(nonInteractive, allowHostedInferenceStaging) || "cloud";
   return getNonInteractiveModel(providerKey);
 }
 
@@ -499,6 +516,7 @@ module.exports = {
   buildProviderArgs,
   upsertProvider,
   providerExistsInGateway,
+  readGatewayProviderMetadata,
   upsertMessagingProviders,
   getSandboxInferenceConfig,
 };
